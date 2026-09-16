@@ -90,6 +90,12 @@ docker compose logs -f
 The application code is bind-mounted from `./app`, so after the first build
 a code change only needs a container restart, not a rebuild.
 
+The image is also published on the GitHub Container Registry as
+`ghcr.io/geoffmyers/flume-mqtt-bridge`, for `linux/amd64` and `linux/arm64`, with the
+application code in it: `docker compose pull` fetches it instead of
+building. The compose file still mounts `./app` over that copy, so the
+code in your checkout is what runs.
+
 ## Usage
 
 On startup the bridge logs in, discovers every sensor and bridge (gateway)

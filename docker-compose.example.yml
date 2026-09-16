@@ -5,7 +5,7 @@ services:
       additional_contexts:
         ha_mqtt_bridge: ./_shared/ha-mqtt-bridge-toolkit
         python_github_error_reporter: ./_shared/python-github-error-reporter
-    image: flume-mqtt-bridge:local
+    image: ghcr.io/geoffmyers/flume-mqtt-bridge:latest
     container_name: flume-mqtt-bridge
     restart: unless-stopped
     stop_grace_period: 10s
