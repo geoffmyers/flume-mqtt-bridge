@@ -1,0 +1,38 @@
+services:
+  flume-mqtt-bridge:
+    build:
+      context: .
+      additional_contexts:
+        ha_mqtt_bridge: ./_shared/ha-mqtt-bridge-toolkit
+        python_github_error_reporter: ./_shared/python-github-error-reporter
+    image: flume-mqtt-bridge:local
+    container_name: flume-mqtt-bridge
+    restart: unless-stopped
+    stop_grace_period: 10s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges=true
+    env_file:
+      - .env
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    # ThreadedPublisher (from ha-mqtt-bridge-toolkit) touches /tmp/healthy on
+    # every publish. With fast=60s + slow=300s + alert=1800s polls, a fresh
+    # mtime within 600s means the bridge is alive and at least the fast cycle
+    # is making progress.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'mtime=$$(stat -c %Y /tmp/healthy 2>/dev/null) && [ "$$(( $$(date +%s) - mtime ))" -lt 600 ]'
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    volumes:
+      # Application code is bind-mounted (not baked into the image), so a code
+      # change needs only a restart, not a rebuild. Read-only.
+      - ./app:/app:ro
