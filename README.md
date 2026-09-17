@@ -112,6 +112,18 @@ A raw one-minute flow reading is also published on
 — this is not a Home Assistant entity, but a side channel for anything that
 wants to ingest per-minute flow into a time-series database.
 
+Discovery is published per device as devices are discovered, not once at
+startup: a sensor or gateway that Flume's API doesn't report until a later
+poll (newly paired hardware, or one that was simply missing from an early,
+still-warming-up response) gets its Home Assistant entities as soon as it
+shows up, with no bridge restart needed.
+
+The **Smart-Leak Alerts (Recent)** entity counts leak-flagged alerts within
+the last 100 `/usage-alerts` fetched from Flume's API, not a true lifetime
+count (Flume's API doesn't expose one) — it's published as
+`state_class: measurement`, not `total_increasing`, because it can
+legitimately go down as older alerts age out of that window.
+
 ## Configuration
 
 Environment variables, set in `.env` (`.env.example` lists them all):
@@ -126,6 +138,8 @@ Environment variables, set in `.env` (`.env.example` lists them all):
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_USER` | *(empty)* | MQTT username |
 | `MQTT_PASSWORD` | *(required)* | MQTT password |
+| `MQTT_TLS` | `0` | Set to `1` for a broker that requires TLS |
+| `MQTT_CA_FILE` | *(unset)* | Path to a custom CA bundle; leave unset to use the system trust store (only consulted when `MQTT_TLS=1`) |
 | `FAST_POLL_INTERVAL` | `60` | Seconds between current-flow polls |
 | `SLOW_POLL_INTERVAL` | `300` | Seconds between usage-total polls |
 | `ALERT_POLL_INTERVAL` | `1800` | Seconds between Smart Leak / notification polls |

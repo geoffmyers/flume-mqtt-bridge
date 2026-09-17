@@ -1,3 +1,12 @@
+# flume-mqtt-bridge — example deployment
+#
+# Copy this to docker-compose.yml and .env.example to .env, fill in .env,
+# then `docker compose up -d --build`.
+#
+# The image is published as ghcr.io/geoffmyers/flume-mqtt-bridge (`docker compose pull`),
+# or build it here (`docker compose build`). The build
+# vendors the shared HA-discovery/MQTT toolkit from ./_shared — see
+# ARCHITECTURE.md. Requires Docker Compose v2.17+ (for `additional_contexts`).
 services:
   flume-mqtt-bridge:
     build:
@@ -7,23 +16,44 @@ services:
         python_github_error_reporter: ./_shared/python-github-error-reporter
     image: ghcr.io/geoffmyers/flume-mqtt-bridge:latest
     container_name: flume-mqtt-bridge
+    hostname: flume-mqtt-bridge
     restart: unless-stopped
     stop_grace_period: 10s
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges=true
-    env_file:
-      - .env
     deploy:
       resources:
         limits:
           cpus: "0.25"
           memory: 128M
-    # ThreadedPublisher (from ha-mqtt-bridge-toolkit) touches /tmp/healthy on
-    # every publish. With fast=60s + slow=300s + alert=1800s polls, a fresh
-    # mtime within 600s means the bridge is alive and at least the fast cycle
-    # is making progress.
+    environment:
+      FLUME_CLIENT_ID: ${FLUME_CLIENT_ID}
+      FLUME_CLIENT_SECRET: ${FLUME_CLIENT_SECRET}
+      FLUME_USERNAME: ${FLUME_USERNAME}
+      FLUME_PASSWORD: ${FLUME_PASSWORD}
+      MQTT_HOST: ${MQTT_HOST:-mqtt.example.com}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_USER: ${MQTT_USER:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      MQTT_TLS: ${MQTT_TLS:-0}
+      MQTT_CA_FILE: ${MQTT_CA_FILE:-}
+      FAST_POLL_INTERVAL: ${FAST_POLL_INTERVAL:-60}
+      SLOW_POLL_INTERVAL: ${SLOW_POLL_INTERVAL:-300}
+      ALERT_POLL_INTERVAL: ${ALERT_POLL_INTERVAL:-1800}
+      LEAK_HOLD_SECONDS: ${LEAK_HOLD_SECONDS:-1800}
+      HA_DISCOVERY_PREFIX: ${HA_DISCOVERY_PREFIX:-homeassistant}
+      MQTT_TOPIC_PREFIX: ${MQTT_TOPIC_PREFIX:-flume}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Optional production-error reporting — off unless both are set.
+      GITHUB_ERROR_TOKEN: ${GITHUB_ERROR_TOKEN:-}
+      GITHUB_REPO: ${GITHUB_REPO:-}
+      GITHUB_ERROR_ENVIRONMENT: ${GITHUB_ERROR_ENVIRONMENT:-production}
+    # ThreadedPublisher (toolkit) touches /tmp/healthy on every publish. With
+    # fast=60s + slow=300s + alert=1800s polls, a fresh mtime within 600s
+    # means the bridge is alive and at least the fast cycle is making
+    # progress.
     healthcheck:
       test:
         - CMD-SHELL
@@ -33,6 +63,6 @@ services:
       retries: 3
       start_period: 90s
     volumes:
-      # Application code is bind-mounted (not baked into the image), so a code
+      # Application code bind-mounted (not baked into the image) so a code
       # change needs only a restart, not a rebuild. Read-only.
       - ./app:/app:ro

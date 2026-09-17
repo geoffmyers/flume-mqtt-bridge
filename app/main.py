@@ -48,6 +48,7 @@ from ha_mqtt_bridge import (
     iso_now,
     now_ms,
     register_github_error_reporter,
+    watch_ha_birth,
 )
 
 
@@ -69,6 +70,11 @@ MQTT_HOST = os.environ.get("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "")
 MQTT_PASS = os.environ["MQTT_PASSWORD"]
+# Off by default (current behaviour) — set MQTT_TLS=1 for a broker that
+# requires TLS; MQTT_CA_FILE points at a custom CA bundle (system trust
+# store is used when unset).
+MQTT_TLS = os.environ.get("MQTT_TLS", "0") != "0"
+MQTT_CA_FILE = os.environ.get("MQTT_CA_FILE") or None
 
 FAST_POLL = int(os.environ.get("FAST_POLL_INTERVAL", "60"))
 SLOW_POLL = int(os.environ.get("SLOW_POLL_INTERVAL", "300"))
@@ -238,14 +244,14 @@ def fetch_query_active(user_id: int, device_id: str, token: str) -> dict | None:
     return items[0] if items else None
 
 
-def fetch_period_totals(user_id: int, device_id: str, sensor_tz: str, token: str) -> PeriodTotals:
+def fetch_period_totals(
+    user_id: int, device_id: str, sensor_tz: str, token: str,
+    log: logging.Logger | None = None,
+) -> PeriodTotals:
     """Day / Month / Year totals — one query call returns all three."""
     # Compute local-tz datetimes for the request. We use the sensor's tz so
     # "today" lines up with the customer's calendar day.
-    try:
-        tz = _parse_tz(sensor_tz)
-    except Exception:
-        tz = timezone.utc
+    tz = _parse_tz(sensor_tz, log)
     local_now = datetime.now(timezone.utc).astimezone(tz)
     start_of_today = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     start_of_month = start_of_today.replace(day=1)
@@ -290,12 +296,12 @@ def fetch_period_totals(user_id: int, device_id: str, sensor_tz: str, token: str
     )
 
 
-def fetch_last_minute_flow(user_id: int, device_id: str, sensor_tz: str, token: str) -> dict | None:
+def fetch_last_minute_flow(
+    user_id: int, device_id: str, sensor_tz: str, token: str,
+    log: logging.Logger | None = None,
+) -> dict | None:
     """Return the most recent fully-elapsed 1-min flow row, or None."""
-    try:
-        tz = _parse_tz(sensor_tz)
-    except Exception:
-        tz = timezone.utc
+    tz = _parse_tz(sensor_tz, log)
     local_now = datetime.now(timezone.utc).astimezone(tz)
     since = (local_now - timedelta(minutes=3)).strftime("%Y-%m-%d %H:%M:%S")
     until = local_now.strftime("%Y-%m-%d %H:%M:%S")
@@ -337,18 +343,33 @@ def fetch_notifications(user_id: int, token: str, limit: int = 50) -> list[dict]
 # -------------------------------------------------------------- helpers
 
 
-def _parse_tz(tz_name: str) -> timezone:
+_WARNED_TZ_NAMES: set[str] = set()
+
+
+def _parse_tz(tz_name: str, log: logging.Logger | None = None) -> timezone:
     """Parse Flume's tz field. Returns UTC if anything goes wrong.
 
     Flume stores `tz` as an IANA name like "America/New_York". Python's stdlib
     zoneinfo handles those directly; we fall back to UTC if zoneinfo isn't
-    available or the name doesn't resolve.
+    available or the name doesn't resolve — which silently shifts every
+    "today"/"this month"/"this year" boundary for that sensor onto UTC's
+    calendar, not the sensor's own. Warned once per distinct bad name
+    (not every poll) so a persistently wrong tz is visible in the logs
+    without spamming them.
     """
     try:
         from zoneinfo import ZoneInfo
 
         return ZoneInfo(tz_name)  # type: ignore[return-value]
-    except Exception:
+    except Exception as e:
+        if log is not None and tz_name not in _WARNED_TZ_NAMES:
+            _WARNED_TZ_NAMES.add(tz_name)
+            log.warning(
+                "sensor tz %r did not resolve (%s); falling back to UTC — "
+                "period totals and minute-flow windows for this sensor "
+                "will use UTC calendar boundaries, not the sensor's own",
+                tz_name, e,
+            )
         return timezone.utc
 
 
@@ -436,204 +457,239 @@ def _bridge_device_block(b: Bridge) -> dict:
     )
 
 
-def discovery_specs(snap: Snapshot) -> list[tuple[str, str, dict]]:
-    """Return (component, unique_id, payload) triples for HA MQTT discovery."""
+def discovery_specs_sensor(s: Sensor) -> list[tuple[str, str, dict]]:
+    """Return (component, unique_id, payload) triples for one sensor's
+    HA MQTT discovery entities.
+
+    Split out from a single `snap`-wide discovery function (now
+    `discovery_specs`, kept as a full-snapshot convenience wrapper below)
+    so the main loop can publish discovery for exactly the devices that
+    are new since the last poll — see `published_sensor_ids` /
+    `published_bridge_ids` in `main()`."""
     items: list[tuple[str, str, dict]] = []
     avail = availability_block(BRIDGE_LWT_TOPIC)
 
+    dev_uid = f"flume_mqtt_bridge_{s.device_id}"
+    device_block = _sensor_device_block(s)
+    sensor_topic_base = f"{TOPIC_PREFIX}/{s.device_id}"
+
+    sensor_entities = [
+        (
+            "sensor", "current_gpm", "Current Flow",
+            {
+                "device_class": "volume_flow_rate",
+                "unit_of_measurement": "gal/min",
+                "state_class": "measurement",
+                "icon": "mdi:water-pump",
+            },
+        ),
+        (
+            "binary_sensor", "active", "Flow Active",
+            {
+                "device_class": "moving",
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "icon": "mdi:water",
+            },
+        ),
+        (
+            "sensor", "gallons_today", "Gallons Today",
+            {
+                "device_class": "water",
+                "unit_of_measurement": "gal",
+                "state_class": "total_increasing",
+                "icon": "mdi:counter",
+            },
+        ),
+        (
+            "sensor", "gallons_month", "Gallons This Month",
+            {
+                "device_class": "water",
+                "unit_of_measurement": "gal",
+                "state_class": "total_increasing",
+                "icon": "mdi:calendar-month",
+            },
+        ),
+        (
+            "sensor", "gallons_year", "Gallons This Year",
+            {
+                "device_class": "water",
+                "unit_of_measurement": "gal",
+                "state_class": "total_increasing",
+                "icon": "mdi:calendar",
+            },
+        ),
+        (
+            "sensor", "battery", "Battery",
+            {
+                "device_class": "battery",
+                "unit_of_measurement": "%",
+                "state_class": "measurement",
+                "entity_category": "diagnostic",
+            },
+        ),
+        (
+            "sensor", "battery_level", "Battery Level",
+            {
+                "icon": "mdi:battery",
+                "entity_category": "diagnostic",
+            },
+        ),
+        (
+            "binary_sensor", "connected", "Connected",
+            {
+                "device_class": "connectivity",
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "entity_category": "diagnostic",
+            },
+        ),
+        (
+            "binary_sensor", "oriented", "Mounted Correctly",
+            {
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "icon": "mdi:gauge",
+                "entity_category": "diagnostic",
+            },
+        ),
+        (
+            "sensor", "last_seen", "Last Seen",
+            {
+                "device_class": "timestamp",
+                "icon": "mdi:clock-outline",
+                "entity_category": "diagnostic",
+            },
+        ),
+        (
+            "binary_sensor", "smart_leak_active", "Smart Leak Active",
+            {
+                "device_class": "moisture",
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "icon": "mdi:water-alert",
+            },
+        ),
+        (
+            "sensor", "last_leak_event", "Last Smart-Leak Event",
+            {
+                "device_class": "timestamp",
+                "icon": "mdi:water-alert-outline",
+            },
+        ),
+        (
+            # NOT a lifetime count: `/usage-alerts` is fetched with
+            # `limit=100` (see `fetch_usage_alerts`) and this is the
+            # count of leak-flagged alerts within THAT fetched window,
+            # which shrinks as older alerts roll off and newer
+            # non-leak alerts push in — a real total_increasing
+            # statistic can never legitimately decrease, and this one
+            # can. `state_class: measurement` (not `total_increasing`)
+            # plus an honest name reflect what's actually published;
+            # unique_id is unchanged so this stays the same HA entity.
+            "sensor", "leak_event_count", "Smart-Leak Alerts (Recent)",
+            {
+                "state_class": "measurement",
+                "icon": "mdi:counter",
+                "entity_category": "diagnostic",
+            },
+        ),
+        (
+            "sensor", "last_notification", "Last Notification",
+            {
+                "device_class": "timestamp",
+                "icon": "mdi:bell-outline",
+                "entity_category": "diagnostic",
+            },
+        ),
+        (
+            "sensor", "notifications_24h", "Notifications 24h",
+            {
+                "state_class": "measurement",
+                "icon": "mdi:bell-ring",
+                "entity_category": "diagnostic",
+            },
+        ),
+    ]
+    for component, slug, name, extras in sensor_entities:
+        uid = f"{dev_uid}_{slug}"
+        items.append(
+            (
+                component,
+                f"{dev_uid}/{slug}",
+                build_discovery_payload(
+                    name=name,
+                    unique_id=uid,
+                    object_id=uid,
+                    state_topic=f"{sensor_topic_base}/{slug}",
+                    device=device_block,
+                    **avail,
+                    **extras,
+                ),
+            )
+        )
+    return items
+
+
+def discovery_specs_bridge(b: Bridge) -> list[tuple[str, str, dict]]:
+    """Return (component, unique_id, payload) triples for one Flume
+    gateway/bridge's HA MQTT discovery entities. See `discovery_specs_sensor`."""
+    items: list[tuple[str, str, dict]] = []
+    avail = availability_block(BRIDGE_LWT_TOPIC)
+
+    bridge_uid = f"flume_mqtt_bridge_gw_{b.device_id}"
+    device_block = _bridge_device_block(b)
+    bridge_topic_base = f"{TOPIC_PREFIX}/{b.device_id}"
+    bridge_entities = [
+        (
+            "binary_sensor", "connected", "Connected",
+            {
+                "device_class": "connectivity",
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "entity_category": "diagnostic",
+            },
+        ),
+        (
+            "sensor", "last_seen", "Last Seen",
+            {
+                "device_class": "timestamp",
+                "icon": "mdi:clock-outline",
+                "entity_category": "diagnostic",
+            },
+        ),
+    ]
+    for component, slug, name, extras in bridge_entities:
+        uid = f"{bridge_uid}_{slug}"
+        items.append(
+            (
+                component,
+                f"{bridge_uid}/{slug}",
+                build_discovery_payload(
+                    name=name,
+                    unique_id=uid,
+                    object_id=uid,
+                    state_topic=f"{bridge_topic_base}/{slug}",
+                    device=device_block,
+                    **avail,
+                    **extras,
+                ),
+            )
+        )
+    return items
+
+
+def discovery_specs(snap: Snapshot) -> list[tuple[str, str, dict]]:
+    """Full-snapshot convenience wrapper over `discovery_specs_sensor` /
+    `discovery_specs_bridge` — every entity for every currently-known
+    device. `main()` uses the per-device functions directly so it can
+    publish only what's NEW since the last poll; this wrapper exists for
+    callers (tests, a one-shot dump) that want the whole set at once."""
+    items: list[tuple[str, str, dict]] = []
     for s in snap.sensors.values():
-        dev_uid = f"flume_mqtt_bridge_{s.device_id}"
-        device_block = _sensor_device_block(s)
-        sensor_topic_base = f"{TOPIC_PREFIX}/{s.device_id}"
-
-        sensor_entities = [
-            (
-                "sensor", "current_gpm", "Current Flow",
-                {
-                    "device_class": "volume_flow_rate",
-                    "unit_of_measurement": "gal/min",
-                    "state_class": "measurement",
-                    "icon": "mdi:water-pump",
-                },
-            ),
-            (
-                "binary_sensor", "active", "Flow Active",
-                {
-                    "device_class": "moving",
-                    "payload_on": "ON",
-                    "payload_off": "OFF",
-                    "icon": "mdi:water",
-                },
-            ),
-            (
-                "sensor", "gallons_today", "Gallons Today",
-                {
-                    "device_class": "water",
-                    "unit_of_measurement": "gal",
-                    "state_class": "total_increasing",
-                    "icon": "mdi:counter",
-                },
-            ),
-            (
-                "sensor", "gallons_month", "Gallons This Month",
-                {
-                    "device_class": "water",
-                    "unit_of_measurement": "gal",
-                    "state_class": "total_increasing",
-                    "icon": "mdi:calendar-month",
-                },
-            ),
-            (
-                "sensor", "gallons_year", "Gallons This Year",
-                {
-                    "device_class": "water",
-                    "unit_of_measurement": "gal",
-                    "state_class": "total_increasing",
-                    "icon": "mdi:calendar",
-                },
-            ),
-            (
-                "sensor", "battery", "Battery",
-                {
-                    "device_class": "battery",
-                    "unit_of_measurement": "%",
-                    "state_class": "measurement",
-                    "entity_category": "diagnostic",
-                },
-            ),
-            (
-                "sensor", "battery_level", "Battery Level",
-                {
-                    "icon": "mdi:battery",
-                    "entity_category": "diagnostic",
-                },
-            ),
-            (
-                "binary_sensor", "connected", "Connected",
-                {
-                    "device_class": "connectivity",
-                    "payload_on": "ON",
-                    "payload_off": "OFF",
-                    "entity_category": "diagnostic",
-                },
-            ),
-            (
-                "binary_sensor", "oriented", "Mounted Correctly",
-                {
-                    "payload_on": "ON",
-                    "payload_off": "OFF",
-                    "icon": "mdi:gauge",
-                    "entity_category": "diagnostic",
-                },
-            ),
-            (
-                "sensor", "last_seen", "Last Seen",
-                {
-                    "device_class": "timestamp",
-                    "icon": "mdi:clock-outline",
-                    "entity_category": "diagnostic",
-                },
-            ),
-            (
-                "binary_sensor", "smart_leak_active", "Smart Leak Active",
-                {
-                    "device_class": "moisture",
-                    "payload_on": "ON",
-                    "payload_off": "OFF",
-                    "icon": "mdi:water-alert",
-                },
-            ),
-            (
-                "sensor", "last_leak_event", "Last Smart-Leak Event",
-                {
-                    "device_class": "timestamp",
-                    "icon": "mdi:water-alert-outline",
-                },
-            ),
-            (
-                "sensor", "leak_event_count", "Smart-Leak Events Lifetime",
-                {
-                    "state_class": "total_increasing",
-                    "icon": "mdi:counter",
-                    "entity_category": "diagnostic",
-                },
-            ),
-            (
-                "sensor", "last_notification", "Last Notification",
-                {
-                    "device_class": "timestamp",
-                    "icon": "mdi:bell-outline",
-                    "entity_category": "diagnostic",
-                },
-            ),
-            (
-                "sensor", "notifications_24h", "Notifications 24h",
-                {
-                    "state_class": "measurement",
-                    "icon": "mdi:bell-ring",
-                    "entity_category": "diagnostic",
-                },
-            ),
-        ]
-        for component, slug, name, extras in sensor_entities:
-            uid = f"{dev_uid}_{slug}"
-            items.append(
-                (
-                    component,
-                    f"{dev_uid}/{slug}",
-                    build_discovery_payload(
-                        name=name,
-                        unique_id=uid,
-                        object_id=uid,
-                        state_topic=f"{sensor_topic_base}/{slug}",
-                        device=device_block,
-                        **avail,
-                        **extras,
-                    ),
-                )
-            )
-
+        items.extend(discovery_specs_sensor(s))
     for b in snap.bridges.values():
-        bridge_uid = f"flume_mqtt_bridge_gw_{b.device_id}"
-        device_block = _bridge_device_block(b)
-        bridge_topic_base = f"{TOPIC_PREFIX}/{b.device_id}"
-        bridge_entities = [
-            (
-                "binary_sensor", "connected", "Connected",
-                {
-                    "device_class": "connectivity",
-                    "payload_on": "ON",
-                    "payload_off": "OFF",
-                    "entity_category": "diagnostic",
-                },
-            ),
-            (
-                "sensor", "last_seen", "Last Seen",
-                {
-                    "device_class": "timestamp",
-                    "icon": "mdi:clock-outline",
-                    "entity_category": "diagnostic",
-                },
-            ),
-        ]
-        for component, slug, name, extras in bridge_entities:
-            uid = f"{bridge_uid}_{slug}"
-            items.append(
-                (
-                    component,
-                    f"{bridge_uid}/{slug}",
-                    build_discovery_payload(
-                        name=name,
-                        unique_id=uid,
-                        object_id=uid,
-                        state_topic=f"{bridge_topic_base}/{slug}",
-                        device=device_block,
-                        **avail,
-                        **extras,
-                    ),
-                )
-            )
-
+        items.extend(discovery_specs_bridge(b))
     return items
 
 
@@ -792,11 +848,22 @@ def main() -> int:
         lwt_topic=BRIDGE_LWT_TOPIC,
         discovery_prefix=DISCOVERY_PREFIX,
         health_path="/tmp/healthy",
+        tls=MQTT_TLS,
+        ca_file=MQTT_CA_FILE,
     )
     pub.start()
 
     snap = Snapshot(user_id=user_id)
-    discovery_published = False
+    # Tracks which sensor/bridge unique_ids have had discovery published,
+    # NOT a single "have we ever published anything" boolean — a device
+    # that appears after the bridge's first poll (a newly paired Flume
+    # sensor, or one that just came back after Flume's API omitted it
+    # from a transient bad response) needs its own discovery publish,
+    # and a single boolean latched True forever (even from a first poll
+    # that found zero sensors) previously meant it never would.
+    published_sensor_ids: set[str] = set()
+    published_bridge_ids: set[str] = set()
+    warned_no_sensors = False
     last_slow_at = 0.0
     last_alert_at = 0.0
 
@@ -809,6 +876,20 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
+
+    def _on_ha_birth() -> None:
+        # Retained discovery configs usually survive an HA restart, but
+        # not always (a broker restart with no persistence, a manual
+        # "purge retained messages") — forgetting what we've published
+        # makes the next poll's discovery step below re-publish
+        # everything currently known, closing that gap without a bridge
+        # restart.
+        nonlocal published_sensor_ids, published_bridge_ids
+        log.info("HA birth message received; re-publishing discovery")
+        published_sensor_ids = set()
+        published_bridge_ids = set()
+
+    watch_ha_birth(pub, _on_ha_birth, discovery_prefix=DISCOVERY_PREFIX)
 
     while not stopping:
         try:
@@ -824,16 +905,31 @@ def main() -> int:
             snap.sensors = sensors
             snap.bridges = bridges
 
-            if not discovery_published:
-                if not sensors:
-                    log.warning("no Flume sensors found in account")
-                for component, unique_id, payload in discovery_specs(snap):
-                    pub.publish_discovery(
-                        component=component, unique_id=unique_id, payload=payload,
-                    )
-                discovery_published = True
-                log.info("discovery published: %d sensor(s), %d bridge(s)",
-                         len(sensors), len(bridges))
+            if not sensors and not warned_no_sensors:
+                log.warning("no Flume sensors found in account")
+                warned_no_sensors = True
+            elif sensors:
+                warned_no_sensors = False
+
+            new_sensor_ids = set(sensors) - published_sensor_ids
+            new_bridge_ids = set(bridges) - published_bridge_ids
+            if new_sensor_ids or new_bridge_ids:
+                for sid in new_sensor_ids:
+                    for component, unique_id, payload in discovery_specs_sensor(sensors[sid]):
+                        pub.publish_discovery(
+                            component=component, unique_id=unique_id, payload=payload,
+                        )
+                for bid in new_bridge_ids:
+                    for component, unique_id, payload in discovery_specs_bridge(bridges[bid]):
+                        pub.publish_discovery(
+                            component=component, unique_id=unique_id, payload=payload,
+                        )
+                published_sensor_ids |= new_sensor_ids
+                published_bridge_ids |= new_bridge_ids
+                log.info("discovery published: %d new sensor(s), %d new bridge(s) "
+                         "(%d/%d total)",
+                         len(new_sensor_ids), len(new_bridge_ids),
+                         len(published_sensor_ids), len(published_bridge_ids))
 
             for sid, s in sensors.items():
                 try:
@@ -847,7 +943,7 @@ def main() -> int:
                 except Exception as e:
                     log.warning("active flow fetch failed for %s: %s", sid, e)
                 try:
-                    row = fetch_last_minute_flow(user_id, sid, s.tz, access)
+                    row = fetch_last_minute_flow(user_id, sid, s.tz, access, log)
                     publish_minute_flow(pub, sid, row)
                 except Exception as e:
                     log.warning("min-flow fetch failed for %s: %s", sid, e)
@@ -860,7 +956,7 @@ def main() -> int:
             if now_s - last_slow_at >= SLOW_POLL:
                 for sid, s in sensors.items():
                     try:
-                        snap.period[sid] = fetch_period_totals(user_id, sid, s.tz, access)
+                        snap.period[sid] = fetch_period_totals(user_id, sid, s.tz, access, log)
                     except Exception as e:
                         log.warning("period totals fetch failed for %s: %s", sid, e)
                 publish_period_totals(pub, snap)

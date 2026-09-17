@@ -13,8 +13,8 @@ permissions:
   contents: read
 
 jobs:
-  compile-import-smoke-test:
-    name: compile + import smoke test
+  tests:
+    name: tests
     runs-on: ubuntu-latest
     container: python:3.12-bookworm
     timeout-minutes: 20
@@ -24,12 +24,13 @@ jobs:
         working-directory: app
     steps:
       - uses: actions/checkout@v6
-      - name: compile + import smoke test
+      - name: tests
         run: |
           python -m venv /tmp/venv
           . /tmp/venv/bin/activate
           pip install --quiet --upgrade pip
-          pip install --quiet -r requirements.txt
+          pip install --quiet -r requirements.txt 'pytest>=8'
           pip install --quiet ../_shared/ha-mqtt-bridge-toolkit ../_shared/python-github-error-reporter
           python -m compileall -q .
           FLUME_CLIENT_ID=x FLUME_CLIENT_SECRET=x FLUME_USERNAME=x FLUME_PASSWORD=x MQTT_PASSWORD=x python -c "import main"
+          FLUME_CLIENT_ID=x FLUME_CLIENT_SECRET=x FLUME_USERNAME=x FLUME_PASSWORD=x MQTT_PASSWORD=x python -m pytest -q
