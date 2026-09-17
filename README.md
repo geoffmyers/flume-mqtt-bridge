@@ -6,6 +6,7 @@
 
 <!-- BADGES:START -->
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-3776ab?style=flat-square&logo=python)
+[![Container image](https://img.shields.io/badge/ghcr.io-geoffmyers%2Fflume--mqtt--bridge-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/geoffmyers/flume-mqtt-bridge/pkgs/container/flume-mqtt-bridge)
 [![Licence GPL-3.0-or-later](https://img.shields.io/badge/licence-GPL--3.0--or--later-blue?style=flat-square)](LICENSE.md)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](CONTRIBUTING.md)
 <!-- BADGES:END -->
